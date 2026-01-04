@@ -160,7 +160,18 @@ with st.sidebar:
     city_input = st.text_input("City or 'Lat-Lon'", "Darbhanga")
     if st.button("Refresh weather", type="secondary"):
         st.session_state.weather_nonce += 1
+        # Clear local weather cache
         fetch_weather.clear()
+        # Inform backend so sensor_feed uses the same city
+        try:
+            requests.post(
+                "http://127.0.0.1:5000/set_city",
+                json={"city": city_input},
+                timeout=2,
+            )
+        except Exception:
+            # Fail silently; dashboard will still use direct API
+            pass
     weather = fetch_weather(city_input, st.session_state.weather_nonce)
     if weather.get("error"):
         msg = weather.get("msg", "Weather fetch failed")
@@ -238,16 +249,32 @@ temp_factor = min(max((temperature - ideal_temp) / 28, 0), 1)
 ac_bump     = round(min(1 + occ_factor*2 + temp_factor*2, 5), 1)
 dim_pct     = round(min(10 + occ_factor*30 + temp_factor*20, 60), 0)
 
-# ─── 8) RULE-BASED PREDICTION (no sklearn/numpy) ────────────────────────────────
-def rule_based_predict(hour, temperature, occupancy, is_weekend):
-    base = 200.0
-    temp_component = 5.0 * float(temperature)
-    occ_component = 2.0 * float(occupancy)
-    weekend_component = 20.0 * (1 if int(is_weekend) else 0)
-    hour_component = 10.0 * math.sin(2 * math.pi * (float(hour) - 12.0) / 24.0)
-    return base + temp_component + occ_component + weekend_component + hour_component
+# ─── 8) PREDICTION VIA BACKEND ML MODEL ─────────────────────────────────────────────
+def get_backend_prediction(hour, temperature, occupancy, is_weekend):
+    """Call the backend /predict endpoint to use the trained RandomForest model."""
+    try:
+        payload = {
+            "hour": int(hour),
+            "temperature": float(temperature),
+            "occupancy": int(occupancy),
+            "is_weekend": int(is_weekend)
+        }
+        resp = requests.post("http://127.0.0.1:5000/predict", json=payload, timeout=2)
+        resp.raise_for_status()
+        data = resp.json()
+        return float(data.get("predicted_usage_kW", 0.0)), data.get("model_type", "unknown"), data.get("temperature_used", temperature)
+    except Exception as e:
+        # Fallback to a simple rule if backend is down
+        print(f"Backend prediction failed: {e}")
+        base = 200.0
+        temp_component = 5.0 * float(temperature)
+        occ_component = 2.0 * float(occupancy)
+        weekend_component = 20.0 * (1 if int(is_weekend) else 0)
+        hour_component = 10.0 * math.sin(2 * math.pi * (float(hour) - 12.0) / 24.0)
+        pred = base + temp_component + occ_component + weekend_component + hour_component
+        return float(pred), "fallback", temperature
 
-pred_usage = float(rule_based_predict(hour, temperature, occupancy, int(is_weekend)))
+pred_usage, model_type_used, temp_used = get_backend_prediction(hour, temperature, occupancy, int(is_weekend))
 
 # ─── DYNAMIC SAFETY BUFFER ───────────────────────────────────────────────────────
 # Cap predicted usage to maintain a dynamic safety margin (15% of current, 10–60 kW)
@@ -257,6 +284,18 @@ if pred_usage > max_allowed:
     pred_usage = max_allowed
 
 # ─── 9) OVERVIEW METRICS ────────────────────────────────────────────────────────
+st.markdown(
+	f"""
+	<div class="metric-card" style="margin-bottom: 1rem;">
+	  <div class="metric-label">Live Store Overview</div>
+	  <div class="metric-value">
+	    {weather['city']} • {temperature:.1f}°C • {occupancy} people • {current_usage:.1f} kW
+	  </div>
+	</div>
+	""",
+	unsafe_allow_html=True,
+)
+
 st.markdown("##  Overview", unsafe_allow_html=True)
 c1, c2, c3, c4 = st.columns(4, gap="large")
 
@@ -269,9 +308,9 @@ c2.metric("Predicted Usage (kW)", f"{pred_usage:.2f}", delta=f"{delta:+.2f}")
 
 # 3) Savings %
 if current_usage:
-    savings_pct = max(0.0, (current_usage - pred_usage) / current_usage * 100)
+	savings_pct = max(0.0, (current_usage - pred_usage) / current_usage * 100)
 else:
-    savings_pct = 0.0
+	savings_pct = 0.0
 c3.metric("Savings %", f"{savings_pct:.0f}%")
 
 # 4) Monthly ₹
@@ -281,69 +320,47 @@ c4.metric("Monthly Savings (₹)", f"{monthly_savings:,.0f}")
 # ─── 10) AI RECOMMENDATIONS ─────────────────────────────────────────────────────
 st.markdown("##  AI Recommendations")
 if occupancy == 0:
-    st.info("No occupancy detected: dim lights by 60% and set AC to energy-saver mode.")
+	st.info("No occupancy detected: dim lights by 60% and set AC to energy-saver mode.")
 else:
-    st.success(f"Increase AC setpoint by +{ac_bump}°C to reduce cooling load.")
-    st.success(f"Dim ambient lighting by {dim_pct}% while maintaining aisle task lighting.")
+	st.success(f"Increase AC setpoint by +{ac_bump}°C to reduce cooling load.")
+	st.success(f"Dim ambient lighting by {dim_pct}% while maintaining aisle task lighting.")
 
-# ─── 10.5) WHAT‑IF SANDBOX (IST) ────────────────────────────────────────────────
-st.markdown("### What‑if Sandbox (IST)")
-wa, wb, wc, wd = st.columns([2,2,2,3])
-with wa:
-    sw_occ = st.slider("Sim occupancy", 0, 200, value=int(occupancy))
-with wb:
-    sw_temp = st.slider("Sim outside temp (°C)", -10, 45, value=int(temperature))
-with wc:
-    sw_hour = st.slider("Sim hour (IST)", 0, 23, value=int(hour))
-with wd:
-    sw_weekend = st.selectbox("Weekend? (sim)", ["No","Yes"], index=1 if is_weekend else 0) == "Yes"
-
-sim_pred = float(rule_based_predict(sw_hour, sw_temp, sw_occ, int(sw_weekend)))
-if sim_pred > max_allowed:
-    sim_pred = max_allowed
-st.caption(f"Simulated predicted usage: {sim_pred:.1f} kW (buffered) at {sw_hour:02d}:00 IST")
-
-# ─── 11) HISTORICAL & DUAL‑AXIS CHART ───────────────────────────────────────────
+# ─── 11) TRENDS CHART (REAL DATA SAMPLE) ────────────────────────────────────────
 try:
-    import pandas as pd
-    import altair as alt
-    csv_path = (Path(__file__).resolve().parent / "simulated_energy.csv").as_posix()
-    df = pd.read_csv(csv_path)
-    if "timestamp" not in df.columns:
-        n     = len(df)
-        end   = now
-        start = end - datetime.timedelta(hours=n-1)
-        df["timestamp"] = pd.date_range(start, periods=n, freq="h")
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    st.markdown("##  Trends (24h)")
-    latest = df.tail(24)
-    base = alt.Chart(latest).encode(x="timestamp:T")
-    usage_line = base.mark_line(color=accent_hex, strokeWidth=2).encode(y=alt.Y("energy_usage:Q", axis=alt.Axis(title="kW")))
-    temp_line = base.mark_line(color="#9AA4B2", strokeDash=[4,3]).encode(y=alt.Y("temperature:Q", axis=alt.Axis(title="°C"), scale=alt.Scale(zero=False)), tooltip=["timestamp","temperature"])
-    chart = alt.layer(usage_line, temp_line).resolve_scale(y="independent")
-    st.altair_chart(chart, use_container_width=True)
-except Exception:
-    st.info("Historical chart unavailable (install pandas/altair).")
+	import pandas as pd
+	import altair as alt
+	csv_path = (Path(__file__).resolve().parent / "real_walmart_energy.csv").as_posix()
+	df = pd.read_csv(csv_path)
+	if "timestamp" not in df.columns:
+		# Fallback: create a synthetic hourly index if missing
+		n = len(df)
+		end = now
+		start = end - datetime.timedelta(hours=n-1)
+		df["timestamp"] = pd.date_range(start, periods=n, freq="h")
+	df["timestamp"] = pd.to_datetime(df["timestamp"])
 
-# ─── 12) DOWNLOAD KPIs ──────────────────────────────────────────────────────────
-try:
-    import pandas as pd
-    kpi_df = pd.DataFrame([
-        {
-            "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
-            "city": city_input,
-            "current_kW": current_usage,
-            "predicted_kW": pred_usage,
-            "savings_percent": savings_pct,
-            "monthly_savings_inr": monthly_savings,
-        }
-    ])
-    st.download_button("Download KPIs (CSV)", kpi_df.to_csv(index=False).encode("utf-8"), file_name="kpis.csv", mime="text/csv")
+	st.markdown("##  Energy & Temperature Trends (24h sample)")
+	latest = df.tail(24)
+	base = alt.Chart(latest).encode(x="timestamp:T")
+	usage_line = base.mark_line(color=accent_hex, strokeWidth=2).encode(
+		y=alt.Y("energy_kW:Q", axis=alt.Axis(title="kW")),
+		tooltip=["timestamp", "energy_kW", "temperature"],
+	)
+	temp_line = base.mark_line(color="#9AA4B2", strokeDash=[4,3]).encode(
+		y=alt.Y(
+			"temperature:Q",
+			axis=alt.Axis(title="°C"),
+			scale=alt.Scale(zero=False),
+		),
+		tooltip=["timestamp", "temperature"],
+	)
+	chart = alt.layer(usage_line, temp_line).resolve_scale(y="independent")
+	st.altair_chart(chart, use_container_width=True)
 except Exception:
-    pass
+	st.info("Trend chart unavailable (install pandas/altair and ensure real_walmart_energy.csv exists).")
 
 # ─── 13) FOOTER ──────────────────────────────────────────────────────────────────
 st.markdown(
-    "<hr><small>Built by Ashwanth Elangovan , Soumyadeep Biswas and  Tanishq Farkya • Sustainable Energy Optimizer for Walmart • 2025</small>",
-    unsafe_allow_html=True,
+	"<hr><small> • Sustainable Energy Optimizer for Walmart • 2025</small>",
+	unsafe_allow_html=True,
 )
